@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body></body>
+<canvas></canvas>
+<script>
+  var canvas = document.querySelector("canvas")
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  var ctx = canvas.getContext("2d")
+  ctx.fillStyle = "green"
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight)
+  ctx.moveTo(0, window.innerHeight)
+  ctx.lineTo(window.innerWidth, 0)
+  ctx.stroke()
+
+  let x = 0;
+  let y = 0;
+  let color = "black"
+
+  // event.offsetX, event.offsetY gives the (x,y) offset from the edge of the canvas.
+
+  // Add the event listeners for mousedown, mousemove, and mouseup
+  canvas.addEventListener('mousedown', e => {
+    x = e.offsetX;
+    y = e.offsetY;
+    color = "red"
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    drawLine(ctx, x, y, e.offsetX, e.offsetY);
+    x = e.offsetX;
+    y = e.offsetY;
+  });
+
+  window.addEventListener('mouseup', e => {
+    drawLine(ctx, x, y, e.offsetX, e.offsetY);
+    color = "black"
+  });
+
+  function drawLine(ctx, x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.closePath();
+  }
+</script>
+
+</html>

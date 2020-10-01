@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <script>
+    window.addEventListener("load", function (evt) {
+      console.log("loaded");
+
+      var canvas = document.querySelector("canvas")
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      var ctx = canvas.getContext("2d")
+      ctx.moveTo(0, 0)
+      ctx.lineTo(window.innerWidth, window.innerHeight)
+      ctx.stroke()
+
+      var ws = new WebSocket("ws://localhost:5555/caster/ws");
+      ws.onopen = function (evt) {
+        console.log("OPEN");
+      }
+      ws.onclose = function (evt) {
+        console.log("CLOSE");
+        ws = null;
+      }
+      ws.onmessage = async function (evt) {
+        var reader = new FileReader();
+        reader.readAsDataURL(evt.data);
+        reader.onloadend = function () {
+          var base64data = reader.result;
+          var img = new Image()
+          img.onload = () => {
+            ctx.drawImage(img, 0, 0, img.width, img.height)
+            ctx.fillText("size: " + evt.data.size, 0, 0)
+          }
+          img.src = base64data
+        }
+      }
+      ws.onerror = function (evt) {
+        console.log("ERROR: " + evt.data);
+      }
+      var last = 0
+      document.addEventListener("mousemove", e => {
+        var since = new Date().getTime() - last
+        if (since < 15) return
+        ws.send(JSON.stringify({ type: "mouseMoved", x: e.offsetX, y: e.offsetY }))
+        last = new Date().getTime()
+      })
+      document.addEventListener("mousedown", e => {
+        ws.send(JSON.stringify({ type: "mousePressed", x: e.offsetX, y: e.offsetY }))
+      })
+      document.addEventListener("mouseup", e => {
+        ws.send(JSON.stringify({ type: "mouseReleased", x: e.offsetX, y: e.offsetY }))
+      })
+      // scroll?
+      document.addEventListener("keydown", e => {
+        var args = { key: e.key, keyCode: e.keyCode, code: e.code, type: "keyDown" }
+        console.log(args)
+        ws.send(JSON.stringify(args))
+      })
+      document.addEventListener("keyup", e => {
+        var args = { key: e.key, keyCode: e.keyCode, code: e.code, type: "keyUp" }
+        console.log(args)
+        ws.send(JSON.stringify(args))
+      })
+    });
+  </script>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas></canvas>
+</body>
+
+</html>
