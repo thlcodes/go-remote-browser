@@ -163,6 +163,7 @@
     const socket = io({
       path: "/caster/sock"
     });
+    window.socket = socket;
 
     socket.on("connect", e => {
       socket.emit("start", { width: w, height: h })
@@ -184,6 +185,9 @@
       img.src = "data:application/octet-stream;base64," + data
     })
 
+    window.addEventListener("beforeunload", () => {
+      socket.close()
+    })
   </script>
 </body>
 

@@ -14,6 +14,7 @@ import (
 	"github.com/mafredri/cdp/devtool"
 	"github.com/mafredri/cdp/protocol/page"
 	"github.com/mafredri/cdp/rpcc"
+	"github.com/pkg/errors"
 )
 
 func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, err error) {
@@ -74,6 +75,10 @@ func screencast(ctx context.Context, port int, c *cdp.Client, w, h int, client c
 
 		for {
 			ev, err := screencastFrame.Recv()
+			if errors.Cause(err) == context.Canceled {
+				close(client)
+				return
+			}
 			if err != nil {
 				log.Printf("Failed to receive ScreencastFrame: %v", err)
 				return

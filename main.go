@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -68,6 +69,7 @@ func main() {
 		sig := <-sigs
 		log.Printf("got signal %v", sig)
 		for _, client := range clients {
+			client.sock.Close()
 			select {
 			case client.stop <- struct{}{}:
 			default:
@@ -120,7 +122,10 @@ func sio() (server *socketio.Server) {
 	})
 
 	server.OnError("/", func(s socketio.Conn, e error) {
-		log.Println("error:", e)
+		if e == io.EOF {
+			return
+		}
+		log.Println("socket-error:", e)
 	})
 
 	server.OnDisconnect("/", func(s socketio.Conn, reason string) {
@@ -174,7 +179,6 @@ func start(sock socketio.Conn, evt Event) (err error) {
 				client.sock.Emit("frame", frame)
 			}
 		}(client)
-		defer close(client.data)
 		if err := client.cdp.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
 			log.Printf("resize err %v", err)
 			sock.Emit("error", fmt.Sprintf("set size error %v", err))
