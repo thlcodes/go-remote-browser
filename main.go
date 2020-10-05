@@ -171,8 +171,7 @@ func start(sock socketio.Conn, evt Event) (err error) {
 		defer conn.Close()
 		go func(client *Client) {
 			for frame := range client.data {
-				client.sock.
-					client.sock.Emit("frame", frame)
+				client.sock.Emit("frame", frame)
 			}
 		}(client)
 		defer close(client.data)
