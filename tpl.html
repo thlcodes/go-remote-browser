@@ -51,7 +51,7 @@
       })
 
       var prot = "ws"
-      if (window.location.protocol.startsWith("https")) prot = wss
+      if (window.location.protocol.startsWith("https")) prot = "wss"
       const wsurl = prot + "://" + window.location.host + window.location.pathname + "ws"
       ws = new WebSocket(wsurl);
       ws.onopen = function (evt) {
