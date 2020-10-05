@@ -4,9 +4,7 @@
 <head>
   <meta charset="utf-8">
   <script>
-    function modifiersForEvent(event) {
-      return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
-    }
+
     var ws;
 
     /*window.addEventListener("load", function (evt) {
@@ -148,15 +146,44 @@
   <canvas></canvas>
   <script src="https://cdn.socket.io/socket.io-1.2.0.js"></script>
   <script>
+    function modifiersForEvent(event) {
+      return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
+    }
+
+    var canvas = document.querySelector("canvas")
+    var w = window.innerWidth;
+    var h = window.innerHeight - document.querySelector("#addressbar").clientHeight;
+    canvas.width = w;
+    canvas.height = h;
+    var ctx = canvas.getContext("2d")
+    ctx.moveTo(0, 0)
+    ctx.lineTo(w, h)
+    ctx.stroke()
+
     const socket = io({
       path: "/caster/sock"
     });
-    socket.onopen(() => {
-      console.log("open")
+
+    socket.on("connect", e => {
+      socket.emit("start", { width: w, height: h })
     });
-    socket.on("counter", i => {
-      console.log(i)
+
+    socket.on("disconnect", e => {
+      console.log("disconnect", e)
+    });
+
+    socket.on("error", e => {
+      console.log("error", e)
+    });
+
+    socket.on("frame", data => {
+      var img = new Image()
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, img.width, img.height)
+      }
+      img.src = "data:application/octet-stream;base64," + data
     })
+
   </script>
 </body>
 

@@ -2,28 +2,18 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/mafredri/cdp"
-	"github.com/mafredri/cdp/devtool"
 	"github.com/mafredri/cdp/protocol/emulation"
-	"github.com/mafredri/cdp/protocol/input"
-	"github.com/mafredri/cdp/protocol/page"
 	"github.com/mafredri/cdp/rpcc"
-
-	"github.com/gorilla/websocket"
 
 	socketio "github.com/googollee/go-socket.io"
 	"github.com/googollee/go-socket.io/engineio"
@@ -37,13 +27,19 @@ const uri = "https://google.com"
 
 //const uri = "http://localhost:5000"
 
-var upgrader = websocket.Upgrader{EnableCompression: true, CheckOrigin: func(r *http.Request) bool { return true }}
+type Client struct {
+	id   string
+	sock socketio.Conn
+	port int
+	cdp  *cdp.Client
+	proc *os.Process
+	data chan []byte
+	stop chan struct{}
+}
 
-var stops = map[int]chan struct{}{}
-var idx = 0
-var lock sync.Mutex
+var clients = map[string]*Client{}
 
-type event struct {
+type Event struct {
 	Type       string  `json:"type"`
 	X          int     `json:"x"`
 	Y          int     `json:"y"`
@@ -71,9 +67,9 @@ func main() {
 	go func() {
 		sig := <-sigs
 		log.Printf("got signal %v", sig)
-		for _, s := range stops {
+		for _, client := range clients {
 			select {
-			case s <- struct{}{}:
+			case client.stop <- struct{}{}:
 			default:
 			}
 		}
@@ -98,10 +94,7 @@ func main() {
 
 	sioserver := sio()
 	defer sioserver.Close()
-	http.Handle(base+"/sock/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		log.Printf("/sock %s", r.URL.String())
-		sioserver.ServeHTTP(rw, r)
-	}))
+	http.Handle(base+"/sock/", sioserver)
 
 	panic(http.ListenAndServe("localhost:5555", nil))
 }
@@ -114,37 +107,27 @@ func sio() (server *socketio.Server) {
 	})
 	server.OnConnect("/", func(s socketio.Conn) error {
 		s.SetContext("")
-		fmt.Println("connected:", s.ID())
-		for i := 0; i < 10; i++ {
-			s.Emit("counter", i)
-			time.Sleep(1 * time.Second)
-		}
+		log.Println("connected:", s.ID())
 		return nil
 	})
 
-	server.OnEvent("/", "notice", func(s socketio.Conn, msg string) {
-		fmt.Println("notice:", msg)
-		s.Emit("reply", "have "+msg)
+	server.OnEvent("/", "start", func(s socketio.Conn, evt Event) {
+		start(s, evt)
 	})
 
-	server.OnEvent("/chat", "msg", func(s socketio.Conn, msg string) string {
-		s.SetContext(msg)
-		return "recv " + msg
-	})
-
-	server.OnEvent("/", "bye", func(s socketio.Conn) string {
-		last := s.Context().(string)
-		s.Emit("bye", last)
-		s.Close()
-		return last
+	server.OnEvent("/", "event", func(s socketio.Conn, msg string) {
+		log.Printf("event: %s", msg)
 	})
 
 	server.OnError("/", func(s socketio.Conn, e error) {
-		fmt.Println("meet error:", e)
+		log.Println("error:", e)
 	})
 
 	server.OnDisconnect("/", func(s socketio.Conn, reason string) {
-		fmt.Println("closed", reason)
+		if client, found := clients[s.ID()]; found {
+			client.stop <- struct{}{}
+		}
+		log.Println("closed", reason)
 	})
 
 	go server.Serve()
@@ -152,130 +135,60 @@ func sio() (server *socketio.Server) {
 	return
 }
 
-func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, err error) {
-	devt := devtool.New(fmt.Sprintf("http://localhost:%d", port))
-	pageTarget, err := devt.Get(ctx, devtool.Page)
+func start(sock socketio.Conn, evt Event) (err error) {
+	client, found := clients[sock.ID()]
+	if !found {
+		client = &Client{
+			id:   sock.ID(),
+			sock: sock,
+			stop: make(chan struct{}),
+			data: make(chan []byte, 10),
+		}
+		clients[sock.ID()] = client
+	}
+	if client.proc != nil {
+		log.Printf("killing %d on %d", client.proc.Pid, client.port)
+		if err = client.proc.Kill(); err != nil {
+			err = fmt.Errorf("clould not kill %d: %w", client.proc.Pid, err)
+			return
+		}
+	}
+	client.port, client.proc, err = startChrome(evt.Width, evt.Height)
 	if err != nil {
 		return
 	}
-
-	for i := 0; i < 30; i++ {
-		conn, err = rpcc.DialContext(ctx, pageTarget.WebSocketDebuggerURL)
-		if err == nil {
-			break
+	go func(client *Client) {
+		var err error
+		var conn *rpcc.Conn
+		ctx, cancel := context.WithCancel(context.TODO())
+		defer cancel()
+		if client.cdp, conn, err = newClient(ctx, client.port); err != nil {
+			log.Printf("ERROR newClient err %v", err)
+			sock.Emit("error", fmt.Sprintf("newClient error %v", err))
+			return
 		}
 		time.Sleep(100 * time.Millisecond)
-		log.Printf("try %d", i)
-	}
-	if err != nil {
-		return
-	}
-
-	c = cdp.NewClient(conn)
-	return
-}
-
-func run(ctx context.Context, port int, c *cdp.Client, w, h int, client chan []byte, stop chan struct{}) error {
-	var err error
-	err = c.Page.Enable(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Navigate to GitHub, block until ready.
-	loadEventFired, err := c.Page.LoadEventFired(ctx)
-	if err != nil {
-		return err
-	}
-
-	_, err = c.Page.Navigate(ctx, page.NewNavigateArgs(uri))
-	if err != nil {
-		return err
-	}
-
-	_, err = loadEventFired.Recv()
-	if err != nil {
-		return err
-	}
-	loadEventFired.Close()
-
-	// Start listening to ScreencastFrame events.
-	screencastFrame, err := c.Page.ScreencastFrame(ctx)
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		defer screencastFrame.Close()
-
-		for {
-			ev, err := screencastFrame.Recv()
-			if err != nil {
-				log.Printf("Failed to receive ScreencastFrame: %v", err)
-				return
+		defer conn.Close()
+		go func(client *Client) {
+			for frame := range client.data {
+				client.sock.
+					client.sock.Emit("frame", frame)
 			}
-
-			go func() {
-				err = c.Page.ScreencastFrameAck(ctx, page.NewScreencastFrameAckArgs(ev.SessionID))
-				if err != nil {
-					log.Printf("Failed to ack ScreencastFrame: %v", err)
-					return
-				}
-			}()
-
-			select {
-			case client <- ev.Data:
-			default:
-			}
+		}(client)
+		defer close(client.data)
+		if err := client.cdp.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
+			log.Printf("resize err %v", err)
+			sock.Emit("error", fmt.Sprintf("set size error %v", err))
 		}
-	}()
-
-	log.Printf("starting screencast on %d", port)
-	screencastArgs := page.NewStartScreencastArgs().
-		SetEveryNthFrame(2).
-		SetFormat("jpeg").
-		SetQuality(90).SetMaxHeight(2000).SetMaxWidth(2000)
-	err = c.Page.StartScreencast(ctx, screencastArgs)
-	if err != nil {
-		return err
-	}
-
-	<-stop
-
-	log.Printf("stopping screencast on %d", port)
-	err = c.Page.StopScreencast(ctx)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func startChrome(width, height int) (port int, proc *os.Process, err error) {
-	port = getFreePort()
-	args := "--headless " + fmt.Sprintf("--remote-debugging-port=%d", port) + " " + fmt.Sprintf("--window-size=%d,%d", width, height)
-	log.Println("args: ", args)
-	cmd := exec.Command("./Google Chrome", strings.Split(args, " ")...)
-	cmd.Dir = "/Applications/Google Chrome.app/Contents/MacOS"
-	if err = cmd.Start(); err != nil {
-		return
-	}
-	proc = cmd.Process
-	time.Sleep(1000 * time.Millisecond)
-	log.Printf("procID for %d: %d", port, cmd.Process.Pid)
+		if err := screencast(ctx, client.port, client.cdp, evt.Width, evt.Height, client.data, client.stop); err != nil {
+			log.Printf("ERROR run err %v", err)
+			sock.Emit("error", fmt.Sprintf("start screencast error %v", err))
+		}
+	}(client)
 	return
 }
 
-func getFreePort() int {
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		panic(err)
-	}
-
-	return lis.Addr().(*net.TCPAddr).Port
-}
-
-func ws(w http.ResponseWriter, r *http.Request) {
+/*func ws(w http.ResponseWriter, r *http.Request) {
 	var c *cdp.Client
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -423,3 +336,4 @@ func ws(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(stops, clientid)
 }
+*/
