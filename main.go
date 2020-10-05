@@ -77,6 +77,9 @@ func main() {
 	}()
 
 	http.Handle(base+"/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, h := range r.Header {
+			log.Printf("%s: %s", k, strings.Join(h, ", "))
+		}
 		var c *cdp.Client
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {

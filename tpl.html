@@ -50,7 +50,9 @@
         ws.send(JSON.stringify({ type: "resize", width: w, height: h }))
       })
 
-      const wsurl = "ws://" + window.location.host + window.location.pathname + "ws"
+      var prot = "ws"
+      if (window.location.protocol.startsWith("https")) prot = wss
+      const wsurl = prot + "://" + window.location.host + window.location.pathname + "ws"
       ws = new WebSocket(wsurl);
       ws.onopen = function (evt) {
         console.log("OPEN");
