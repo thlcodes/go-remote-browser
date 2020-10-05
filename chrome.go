@@ -40,29 +40,12 @@ func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, e
 	return
 }
 
-func screencast(ctx context.Context, port int, c *cdp.Client, w, h int, client chan []byte, stop chan struct{}) error {
+func configureScreencast(ctx context.Context, c *cdp.Client, data chan []byte, stop chan struct{}) error {
 	var err error
 	err = c.Page.Enable(ctx)
 	if err != nil {
 		return err
 	}
-
-	// Navigate to GitHub, block until ready.
-	loadEventFired, err := c.Page.LoadEventFired(ctx)
-	if err != nil {
-		return err
-	}
-
-	_, err = c.Page.Navigate(ctx, page.NewNavigateArgs(uri))
-	if err != nil {
-		return err
-	}
-
-	_, err = loadEventFired.Recv()
-	if err != nil {
-		return err
-	}
-	loadEventFired.Close()
 
 	// Start listening to ScreencastFrame events.
 	screencastFrame, err := c.Page.ScreencastFrame(ctx)
@@ -76,7 +59,7 @@ func screencast(ctx context.Context, port int, c *cdp.Client, w, h int, client c
 		for {
 			ev, err := screencastFrame.Recv()
 			if errors.Cause(err) == context.Canceled {
-				close(client)
+				close(data)
 				return
 			}
 			if err != nil {
@@ -93,31 +76,31 @@ func screencast(ctx context.Context, port int, c *cdp.Client, w, h int, client c
 			}()
 
 			select {
-			case client <- ev.Data:
+			case data <- ev.Data:
 			default:
 			}
 		}
 	}()
+	return nil
+}
 
+func startScreencast(ctx context.Context, port int, c *cdp.Client, w, h int) error {
 	log.Printf("starting screencast on %d", port)
 	screencastArgs := page.NewStartScreencastArgs().
-		SetEveryNthFrame(2).
+		SetEveryNthFrame(1).
 		SetFormat("jpeg").
-		SetQuality(90).SetMaxHeight(2000).SetMaxWidth(2000)
-	err = c.Page.StartScreencast(ctx, screencastArgs)
+		SetQuality(90).SetMaxHeight(h).SetMaxWidth(w)
+	err := c.Page.StartScreencast(ctx, screencastArgs)
 	if err != nil {
 		return err
 	}
-
-	<-stop
-
-	log.Printf("stopping screencast on %d", port)
-	err = c.Page.StopScreencast(ctx)
-	if err != nil {
-		return err
-	}
-
 	return nil
+}
+
+func stopScreencast(ctx context.Context, port int, c *cdp.Client) error {
+	log.Printf("stopping screencast on %d", port)
+	err := c.Page.StopScreencast(ctx)
+	return err
 }
 
 func startChrome(width, height int) (port int, proc *os.Process, err error) {
