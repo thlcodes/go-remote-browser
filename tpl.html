@@ -4,20 +4,57 @@
 <head>
   <meta charset="utf-8">
   <script>
+    function modifiersForEvent(event) {
+      return (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0);
+    }
+    var ws;
+
     window.addEventListener("load", function (evt) {
       console.log("loaded");
 
+      document.querySelector("#btnGo").addEventListener("click", (e) => {
+        const evt = { type: "navigateTo", url: document.querySelector("input").value }
+        ws.send(JSON.stringify(evt))
+      })
+
+      document.querySelector("#btnBack").addEventListener("click", (e) => {
+        const evt = { type: "navigateBack" }
+        ws.send(JSON.stringify(evt))
+      })
+
+      document.querySelector("#btnForward").addEventListener("click", (e) => {
+        const evt = { type: "navigateForward" }
+        ws.send(JSON.stringify(evt))
+      })
+
       var canvas = document.querySelector("canvas")
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      var w = window.innerWidth;
+      var h = window.innerHeight - document.querySelector("#addressbar").clientHeight;
+      canvas.width = w;
+      canvas.height = h;
       var ctx = canvas.getContext("2d")
       ctx.moveTo(0, 0)
-      ctx.lineTo(window.innerWidth, window.innerHeight)
+      ctx.lineTo(w, h)
       ctx.stroke()
 
-      var ws = new WebSocket("ws://localhost:5555/caster/ws");
+      document.querySelector("#btnR").addEventListener("click", e => {
+        ws.send(JSON.stringify({ type: "resize", width: w, height: h }))
+      })
+
+      var lastR = 0
+      window.addEventListener("resize", e => {
+        w = window.innerWidth;
+        h = window.innerHeight - document.querySelector("#addressbar").clientHeight;
+        canvas.width = w;
+        canvas.height = h;
+        ws.send(JSON.stringify({ type: "resize", width: w, height: h }))
+      })
+
+      const wsurl = "ws://" + window.location.host + window.location.pathname + "ws"
+      ws = new WebSocket(wsurl);
       ws.onopen = function (evt) {
         console.log("OPEN");
+        ws.send(JSON.stringify({ type: "start", width: w, height: h }))
       }
       ws.onclose = function (evt) {
         console.log("CLOSE");
@@ -39,30 +76,45 @@
       ws.onerror = function (evt) {
         console.log("ERROR: " + evt.data);
       }
-      var last = 0
+      var lastMove = 0
+      var lastWheel = 0
+      const buttons = { 0: 'none', 1: 'left', 2: 'middle', 3: 'right' };
       document.addEventListener("mousemove", e => {
-        var since = new Date().getTime() - last
+        var since = new Date().getTime() - lastMove
         if (since < 15) return
-        ws.send(JSON.stringify({ type: "mouseMoved", x: e.offsetX, y: e.offsetY }))
-        last = new Date().getTime()
+        ws.send(JSON.stringify({ type: "mouseMoved", modifiers: modifiersForEvent(e), x: e.offsetX, y: e.offsetY }))
+        lastMove = new Date().getTime()
       })
       document.addEventListener("mousedown", e => {
-        ws.send(JSON.stringify({ type: "mousePressed", x: e.offsetX, y: e.offsetY }))
+        ws.send(JSON.stringify({ type: "mousePressed", button: buttons[event.which], modifiers: modifiersForEvent(e), x: e.offsetX, y: e.offsetY, clickCount: 1 }))
       })
       document.addEventListener("mouseup", e => {
-        ws.send(JSON.stringify({ type: "mouseReleased", x: e.offsetX, y: e.offsetY }))
+        ws.send(JSON.stringify({ type: "mouseReleased", button: buttons[event.which], modifiers: modifiersForEvent(e), x: e.offsetX, y: e.offsetY, clickCount: 1 }))
       })
-      // scroll?
+      document.addEventListener("wheel", e => {
+        var since = new Date().getTime() - lastWheel
+        if (since < 15) return
+        const args = { type: "mouseWheel", button: buttons[event.which], deltaX: e.deltaX, deltaY: e.deltaY, modifiers: modifiersForEvent(e), x: e.offsetX, y: e.offsetY }
+        console.log(args)
+        ws.send(JSON.stringify(args))
+        lastMheel = new Date().getTime()
+      })
       document.addEventListener("keydown", e => {
-        var args = { key: e.key, keyCode: e.keyCode, code: e.code, type: "keyDown" }
+        var args = { keyCode: e.keyCode, key: e.key, code: e.code, modifiers: modifiersForEvent(e), keyIdentifier: e.keyIdentifier, type: "keyDown" }
         console.log(args)
         ws.send(JSON.stringify(args))
       })
       document.addEventListener("keyup", e => {
-        var args = { key: e.key, keyCode: e.keyCode, code: e.code, type: "keyUp" }
+        var args = { keyCode: e.keyCode, key: e.key, code: e.code, modifiers: modifiersForEvent(e), keyIdentifier: e.keyIdentifier, type: "keyUp" }
         console.log(args)
         ws.send(JSON.stringify(args))
       })
+      document.addEventListener("keypress", e => {
+        var args = { keyCode: e.keyCode, key: e.key, code: e.code, modifiers: modifiersForEvent(e), keyIdentifier: e.keyIdentifier, type: "char", text: String.fromCharCode(e.charCode) }
+        console.log(args)
+        ws.send(JSON.stringify(args))
+      })
+
     });
   </script>
   <style>
@@ -72,10 +124,25 @@
       padding: 0;
       overflow: hidden;
     }
+
+    #addressbar {
+      display: flex
+    }
+
+    #addressbar input {
+      flex-grow: 1;
+    }
   </style>
 </head>
 
 <body>
+  <div id="addressbar">
+    <button id="btnBack">←</button>
+    <button id="btnForward">→</button>
+    <input type="text" value="https://google.com" />
+    <button id="btnGo">Go</button>
+    <button id="btnR">R</button>
+  </div>
   <canvas></canvas>
 </body>
 

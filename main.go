@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/mafredri/cdp"
 	"github.com/mafredri/cdp/devtool"
+	"github.com/mafredri/cdp/protocol/emulation"
 	"github.com/mafredri/cdp/protocol/input"
 	"github.com/mafredri/cdp/protocol/page"
 	"github.com/mafredri/cdp/rpcc"
@@ -29,23 +32,31 @@ const uri = "https://google.com"
 
 //const uri = "http://localhost:5000"
 
-var upgrader = websocket.Upgrader{EnableCompression: true}
+var upgrader = websocket.Upgrader{EnableCompression: true, CheckOrigin: func(r *http.Request) bool { return true }}
 
-var clients = map[int]chan []byte{}
+var stops = map[int]chan struct{}{}
 var idx = 0
 var lock sync.Mutex
-var stop chan struct{} = make(chan struct{}, 1)
-
-var c *cdp.Client
-var ctx context.Context
 
 type event struct {
-	Type    string `json:"type"`
-	X       int    `json:"x"`
-	Y       int    `json:"y"`
-	Key     string `json:"key"`
-	KeyCode int    `json:"keyCode`
-	Code    string `json:"code`
+	Type       string  `json:"type"`
+	X          int     `json:"x"`
+	Y          int     `json:"y"`
+	ClickCount int     `json:"clickCount"`
+	Button     string  `json:"button"`
+	DeltaY     float32 `json:"deltaY"`
+	DeltaX     float32 `json:"deltaX"`
+
+	Key       string `json:"key"`
+	KeyCode   int    `json:"keyCode"`
+	Code      string `json:"code"`
+	Modifiers int    `json:"modifiers"`
+	Text      string `json:"text"`
+
+	Width  int `json:"width"`
+	Height int `json:"height"`
+
+	Url string `json:"url"`
 }
 
 func main() {
@@ -55,38 +66,40 @@ func main() {
 	go func() {
 		sig := <-sigs
 		log.Printf("got signal %v", sig)
-		stop <- struct{}{}
+		for _, s := range stops {
+			select {
+			case s <- struct{}{}:
+			default:
+			}
+		}
 		time.Sleep(1 * time.Second)
 		os.Exit(0)
 	}()
 
-	go func() {
-		if err := run(); err != nil {
-			stop <- struct{}{}
-			panic(err)
-		}
-	}()
-
 	http.Handle(base+"/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var c *cdp.Client
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Print("upgrade:", err)
 			return
 		}
 		client := make(chan []byte, 100)
+		stop := make(chan struct{}, 1)
 		lock.Lock()
-		clients[idx] = client
+		stops[idx] = stop
 		clientid := idx
 		idx += 1
 		lock.Unlock()
 		defer conn.Close()
 		go func() {
+			var proc *os.Process
+			var port int
 			for {
 				evt := event{}
 				t, data, err := conn.ReadMessage()
 				if err != nil {
 					log.Printf("got err %v", err)
-					return
+					break
 				}
 				log.Printf("got type %d, data %s,", t, string(data))
 				if t == websocket.CloseMessage {
@@ -96,22 +109,110 @@ func main() {
 					log.Printf("got marshal err %v", err)
 					continue
 				}
+				if evt.Type == "start" {
+					if proc != nil {
+						log.Printf("killing %d on %d", proc.Pid, port)
+						if err := proc.Kill(); err != nil {
+							log.Printf("clould not kill %d: %v", proc.Pid, err)
+						}
+					}
+					port, proc, err = startChrome(evt.Width, evt.Height)
+					if err != nil {
+						w.WriteHeader(500)
+						w.Write([]byte(fmt.Sprintf("start chrome err %v", err)))
+						break
+					}
+					go func() {
+						var err error
+						var conn *rpcc.Conn
+						ctx, cancel := context.WithCancel(context.TODO())
+						defer cancel()
+						if c, conn, err = newClient(ctx, port); err != nil {
+							log.Printf("ERROR newClient err %v", err)
+							w.WriteHeader(500)
+							return
+						}
+						time.Sleep(100 * time.Millisecond)
+						defer conn.Close()
+						if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
+							log.Printf("resize err %v", err)
+						}
+						if err := run(ctx, port, c, evt.Width, evt.Height, client, stop); err != nil {
+							log.Printf("ERROR run err %v", err)
+							w.WriteHeader(500)
+						}
+					}()
+					continue
+				} else if evt.Type == "resize" {
+					if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
+						log.Printf("resize err %v", err)
+					}
+				}
 				if c == nil {
 					continue
 				}
-				if strings.HasPrefix(evt.Type, "mouse") {
+				if strings.HasPrefix(evt.Type, "navigate") {
+					switch evt.Type {
+					case "navigateTo":
+						repl, err := c.Page.Navigate(context.TODO(), page.NewNavigateArgs(evt.Url))
+						if err != nil {
+							log.Printf("navigate error %v", err)
+							continue
+						}
+						if repl.ErrorText != nil {
+							log.Printf("naviagate reply error %s", *repl.ErrorText)
+						}
+					case "navigateBack", "navigateForward":
+						his, err := c.Page.GetNavigationHistory(context.TODO())
+						if err != nil {
+							log.Printf("get history error %v", err)
+							continue
+						}
+						idx := his.CurrentIndex
+						if evt.Type == "navigateBack" && idx > 0 {
+							idx--
+						} else if evt.Type == "navigateForward" && idx < len(his.Entries)-1 {
+							idx++
+						}
+						if idx == his.CurrentIndex {
+							continue
+						}
+						if err := c.Page.NavigateToHistoryEntry(context.TODO(), page.NewNavigateToHistoryEntryArgs(his.Entries[idx].ID)); err != nil {
+							log.Printf("navigateback error %v", err)
+						}
+					}
+				} else if strings.HasPrefix(evt.Type, "mouse") {
 					log.Printf("got mouse event %s", evt.Type)
-					if err := c.Input.DispatchMouseEvent(ctx, input.NewDispatchMouseEventArgs(evt.Type, float64(evt.X), float64(evt.Y))); err != nil {
+					args := input.NewDispatchMouseEventArgs(evt.Type, float64(evt.X), float64(evt.Y))
+					args.SetModifiers(evt.Modifiers).SetButton(input.MouseButton(evt.Button))
+					if evt.ClickCount > 0 {
+						args.SetClickCount(evt.ClickCount)
+					}
+					if evt.Type == "mouseWheel" {
+						args.SetDeltaX(float64(evt.DeltaX)).SetDeltaY(float64(evt.DeltaY))
+					}
+					if err := c.Input.DispatchMouseEvent(context.TODO(), args); err != nil {
 						log.Printf("mouse err %v", err)
 					}
-				} else if strings.HasPrefix(evt.Type, "key") {
+				} else if strings.HasPrefix(evt.Type, "key") || evt.Type == "char" {
 					args := input.NewDispatchKeyEventArgs(evt.Type)
-					args.SetCode(evt.Code).SetText(evt.Key)
-					if err := c.Input.DispatchKeyEvent(ctx, args); err != nil {
+					args.SetCode(evt.Code).SetKey(evt.Key).SetModifiers(evt.Modifiers).SetWindowsVirtualKeyCode(evt.KeyCode).SetNativeVirtualKeyCode(evt.KeyCode)
+					if evt.Text != "" {
+						args.SetText(evt.Text)
+					}
+					if err := c.Input.DispatchKeyEvent(context.TODO(), args); err != nil {
 						log.Printf("key err %v", err)
 					}
 				}
-
+			}
+			if stop != nil {
+				stop <- struct{}{}
+			}
+			if proc != nil {
+				log.Printf("killing %d on %d", proc.Pid, port)
+				if err := proc.Kill(); err != nil {
+					log.Printf("clould not kill %d: %v", proc.Pid, err)
+				}
 			}
 		}()
 
@@ -121,7 +222,7 @@ func main() {
 				break
 			}
 		}
-		delete(clients, clientid)
+		delete(stops, clientid)
 	}))
 
 	http.Handle(base+"/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -135,29 +236,34 @@ func main() {
 		rw.Write(data)
 	}))
 
-	http.ListenAndServe("localhost:5555", nil)
+	panic(http.ListenAndServe("localhost:5555", nil))
 }
 
-func run() error {
-	var cancel func()
-	ctx, cancel = context.WithCancel(context.TODO())
-	defer cancel()
-
-	devt := devtool.New("http://localhost:9222")
-
+func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, err error) {
+	devt := devtool.New(fmt.Sprintf("http://localhost:%d", port))
 	pageTarget, err := devt.Get(ctx, devtool.Page)
 	if err != nil {
-		return err
+		return
 	}
 
-	conn, err := rpcc.DialContext(ctx, pageTarget.WebSocketDebuggerURL)
-	if err != nil {
-		return err
+	for i := 0; i < 30; i++ {
+		conn, err = rpcc.DialContext(ctx, pageTarget.WebSocketDebuggerURL)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		log.Printf("try %d", i)
 	}
-	defer conn.Close()
+	if err != nil {
+		return
+	}
 
 	c = cdp.NewClient(conn)
+	return
+}
 
+func run(ctx context.Context, port int, c *cdp.Client, w, h int, client chan []byte, stop chan struct{}) error {
+	var err error
 	err = c.Page.Enable(ctx)
 	if err != nil {
 		return err
@@ -189,15 +295,12 @@ func run() error {
 	go func() {
 		defer screencastFrame.Close()
 
-		ts := time.Now()
-
 		for {
 			ev, err := screencastFrame.Recv()
 			if err != nil {
 				log.Printf("Failed to receive ScreencastFrame: %v", err)
 				return
 			}
-			//log.Printf("Got frame with sessionID: %d: %+v", ev.SessionID, ev.Metadata)
 
 			go func() {
 				err = c.Page.ScreencastFrameAck(ctx, page.NewScreencastFrameAckArgs(ev.SessionID))
@@ -207,35 +310,18 @@ func run() error {
 				}
 			}()
 
-			took := time.Since(ts)
-			txt := fmt.Sprintf("took: %d, fps: %d, size: %d", took.Milliseconds(), 1000/took.Milliseconds(), len(ev.Data))
-			//log.Println(txt)
-			go func(txt string) {
-				lock.Lock()
-				defer lock.Unlock()
-				for _, client := range clients {
-					//log.Printf("sending to client %d", i)
-					select {
-					case client <- []byte(ev.Data):
-					default:
-					}
-				}
-			}(txt)
-			ts = time.Now()
-
-			/*rand.Seed(time.Now().UnixNano())
-			if err := c.Input.DispatchMouseEvent(ctx, input.NewDispatchMouseEventArgs("mouseMoved", rand.Float64()*1280, rand.Float64()*720)); err != nil {
-				log.Printf("mousemove err %v", err)
-			}*/
+			select {
+			case client <- ev.Data:
+			default:
+			}
 		}
 	}()
 
-	log.Println("starting screencast")
+	log.Printf("starting screencast on %d", port)
 	screencastArgs := page.NewStartScreencastArgs().
 		SetEveryNthFrame(2).
-		SetFormat("png").
-		SetQuality(100).
-		SetMaxWidth(1280).SetMaxHeight(720)
+		SetFormat("jpeg").
+		SetQuality(90).SetMaxHeight(2000).SetMaxWidth(2000)
 	err = c.Page.StartScreencast(ctx, screencastArgs)
 	if err != nil {
 		return err
@@ -243,17 +329,35 @@ func run() error {
 
 	<-stop
 
-	for _, client := range clients {
-		if client != nil {
-			close(client)
-		}
-	}
-
-	log.Println("stopping screencast")
+	log.Printf("stopping screencast on %d", port)
 	err = c.Page.StopScreencast(ctx)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func startChrome(width, height int) (port int, proc *os.Process, err error) {
+	port = getFreePort()
+	args := "--headless " + fmt.Sprintf("--remote-debugging-port=%d", port) + " " + fmt.Sprintf("--window-size=%d,%d", width, height)
+	log.Println("args: ", args)
+	cmd := exec.Command("./Google Chrome", strings.Split(args, " ")...)
+	cmd.Dir = "/Applications/Google Chrome.app/Contents/MacOS"
+	if err = cmd.Start(); err != nil {
+		return
+	}
+	proc = cmd.Process
+	time.Sleep(1000 * time.Millisecond)
+	log.Printf("procID for %d: %d", port, cmd.Process.Pid)
+	return
+}
+
+func getFreePort() int {
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		panic(err)
+	}
+
+	return lis.Addr().(*net.TCPAddr).Port
 }
