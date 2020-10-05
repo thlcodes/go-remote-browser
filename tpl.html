@@ -139,7 +139,7 @@
   <div id="addressbar">
     <button id="btnBack">←</button>
     <button id="btnForward">→</button>
-    <input type="text" value="https://google.com" />
+    <input id="input" type="text" value="https://google.com" />
     <button id="btnGo">Go</button>
     <button id="btnR">R</button>
   </div>
@@ -236,6 +236,12 @@
       socket.emit("event", args)
     })
 
+    document.querySelector("#input").addEventListener("keypress", e => {
+      if (e.keyCode == 13) {
+        const evt = { type: "navigateTo", url: document.querySelector("input").value }
+        socket.emit("event", evt)
+      }
+    })
     document.querySelector("#btnGo").addEventListener("click", (e) => {
       const evt = { type: "navigateTo", url: document.querySelector("input").value }
       socket.emit("event", evt)
