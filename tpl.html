@@ -146,20 +146,17 @@
     <button id="btnR">R</button>
   </div>
   <canvas></canvas>
+  <script src="https://cdn.socket.io/socket.io-1.2.0.js"></script>
   <script>
-    const evtSrc = new EventSource("./sse/")
-
-    evtSrc.onmessage = function (msg) {
-      console.log(msg)
-    }
-
-    evtSrc.onopen = function (e) {
-      console.log(e)
-    }
-
-    evtSrc.onerror = function (er) {
-      console.log(er)
-    }
+    const socket = io({
+      path: "/caster/sock"
+    });
+    socket.onopen(() => {
+      console.log("open")
+    });
+    socket.on("counter", i => {
+      console.log(i)
+    })
   </script>
 </body>
 

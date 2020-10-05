@@ -24,6 +24,11 @@ import (
 	"github.com/mafredri/cdp/rpcc"
 
 	"github.com/gorilla/websocket"
+
+	socketio "github.com/googollee/go-socket.io"
+	"github.com/googollee/go-socket.io/engineio"
+	"github.com/googollee/go-socket.io/engineio/transport"
+	"github.com/googollee/go-socket.io/engineio/transport/polling"
 )
 
 const base = "/caster"
@@ -76,161 +81,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	http.Handle(base+"/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(400)
-		return
-		for k, h := range r.Header {
-			log.Printf("%s: %s", k, strings.Join(h, ", "))
-		}
-		var c *cdp.Client
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Print("upgrade:", err)
+	http.Handle(base+"/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != base+"/" {
+			rw.WriteHeader(404)
 			return
 		}
-		client := make(chan []byte, 100)
-		stop := make(chan struct{}, 1)
-		lock.Lock()
-		stops[idx] = stop
-		clientid := idx
-		idx += 1
-		lock.Unlock()
-		defer conn.Close()
-		go func() {
-			var proc *os.Process
-			var port int
-			for {
-				evt := event{}
-				t, data, err := conn.ReadMessage()
-				if err != nil {
-					log.Printf("got err %v", err)
-					break
-				}
-				log.Printf("got type %d, data %s,", t, string(data))
-				if t == websocket.CloseMessage {
-					break
-				}
-				if err := json.Unmarshal(data, &evt); err != nil {
-					log.Printf("got marshal err %v", err)
-					continue
-				}
-				if evt.Type == "start" {
-					if proc != nil {
-						log.Printf("killing %d on %d", proc.Pid, port)
-						if err := proc.Kill(); err != nil {
-							log.Printf("clould not kill %d: %v", proc.Pid, err)
-						}
-					}
-					port, proc, err = startChrome(evt.Width, evt.Height)
-					if err != nil {
-						w.WriteHeader(500)
-						w.Write([]byte(fmt.Sprintf("start chrome err %v", err)))
-						break
-					}
-					go func() {
-						var err error
-						var conn *rpcc.Conn
-						ctx, cancel := context.WithCancel(context.TODO())
-						defer cancel()
-						if c, conn, err = newClient(ctx, port); err != nil {
-							log.Printf("ERROR newClient err %v", err)
-							w.WriteHeader(500)
-							return
-						}
-						time.Sleep(100 * time.Millisecond)
-						defer conn.Close()
-						if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
-							log.Printf("resize err %v", err)
-						}
-						if err := run(ctx, port, c, evt.Width, evt.Height, client, stop); err != nil {
-							log.Printf("ERROR run err %v", err)
-							w.WriteHeader(500)
-						}
-					}()
-					continue
-				} else if evt.Type == "resize" {
-					if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
-						log.Printf("resize err %v", err)
-					}
-				}
-				if c == nil {
-					continue
-				}
-				if strings.HasPrefix(evt.Type, "navigate") {
-					switch evt.Type {
-					case "navigateTo":
-						repl, err := c.Page.Navigate(context.TODO(), page.NewNavigateArgs(evt.Url))
-						if err != nil {
-							log.Printf("navigate error %v", err)
-							continue
-						}
-						if repl.ErrorText != nil {
-							log.Printf("naviagate reply error %s", *repl.ErrorText)
-						}
-					case "navigateBack", "navigateForward":
-						his, err := c.Page.GetNavigationHistory(context.TODO())
-						if err != nil {
-							log.Printf("get history error %v", err)
-							continue
-						}
-						idx := his.CurrentIndex
-						if evt.Type == "navigateBack" && idx > 0 {
-							idx--
-						} else if evt.Type == "navigateForward" && idx < len(his.Entries)-1 {
-							idx++
-						}
-						if idx == his.CurrentIndex {
-							continue
-						}
-						if err := c.Page.NavigateToHistoryEntry(context.TODO(), page.NewNavigateToHistoryEntryArgs(his.Entries[idx].ID)); err != nil {
-							log.Printf("navigateback error %v", err)
-						}
-					}
-				} else if strings.HasPrefix(evt.Type, "mouse") {
-					log.Printf("got mouse event %s", evt.Type)
-					args := input.NewDispatchMouseEventArgs(evt.Type, float64(evt.X), float64(evt.Y))
-					args.SetModifiers(evt.Modifiers).SetButton(input.MouseButton(evt.Button))
-					if evt.ClickCount > 0 {
-						args.SetClickCount(evt.ClickCount)
-					}
-					if evt.Type == "mouseWheel" {
-						args.SetDeltaX(float64(evt.DeltaX)).SetDeltaY(float64(evt.DeltaY))
-					}
-					if err := c.Input.DispatchMouseEvent(context.TODO(), args); err != nil {
-						log.Printf("mouse err %v", err)
-					}
-				} else if strings.HasPrefix(evt.Type, "key") || evt.Type == "char" {
-					args := input.NewDispatchKeyEventArgs(evt.Type)
-					args.SetCode(evt.Code).SetKey(evt.Key).SetModifiers(evt.Modifiers).SetWindowsVirtualKeyCode(evt.KeyCode).SetNativeVirtualKeyCode(evt.KeyCode)
-					if evt.Text != "" {
-						args.SetText(evt.Text)
-					}
-					if err := c.Input.DispatchKeyEvent(context.TODO(), args); err != nil {
-						log.Printf("key err %v", err)
-					}
-				}
-			}
-			if stop != nil {
-				stop <- struct{}{}
-			}
-			if proc != nil {
-				log.Printf("killing %d on %d", proc.Pid, port)
-				if err := proc.Kill(); err != nil {
-					log.Printf("clould not kill %d: %v", proc.Pid, err)
-				}
-			}
-		}()
-
-		for data := range client {
-			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				log.Printf("error: could not write message %v", err)
-				break
-			}
-		}
-		delete(stops, clientid)
-	}))
-
-	http.Handle(base+"/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		data, err := ioutil.ReadFile("./tpl.html")
 		if err != nil {
 			rw.WriteHeader(500)
@@ -241,33 +96,60 @@ func main() {
 		rw.Write(data)
 	}))
 
-	http.Handle(base+"/sse/", http.HandlerFunc(sse))
+	sioserver := sio()
+	defer sioserver.Close()
+	http.Handle(base+"/sock/", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		log.Printf("/sock %s", r.URL.String())
+		sioserver.ServeHTTP(rw, r)
+	}))
 
 	panic(http.ListenAndServe("localhost:5555", nil))
 }
 
-func sse(rw http.ResponseWriter, r *http.Request) {
-	f, ok := rw.(http.Flusher)
-	if !ok {
-		http.Error(rw, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	}
-	rw.Header().Set("Content-Type", "text/event-stream")
-	rw.Header().Set("Cache-Control", "no-cache")
-	rw.Header().Set("Connection", "keep-alive")
-	rw.Header().Set("Transfer-Encoding", "chunked")
+func sio() (server *socketio.Server) {
+	server, _ = socketio.NewServer(&engineio.Options{
+		Transports: []transport.Transport{
+			polling.Default,
+		},
+	})
+	server.OnConnect("/", func(s socketio.Conn) error {
+		s.SetContext("")
+		fmt.Println("connected:", s.ID())
+		for i := 0; i < 10; i++ {
+			s.Emit("counter", i)
+			time.Sleep(1 * time.Second)
+		}
+		return nil
+	})
 
-	for i := 0; i < 100; i++ {
+	server.OnEvent("/", "notice", func(s socketio.Conn, msg string) {
+		fmt.Println("notice:", msg)
+		s.Emit("reply", "have "+msg)
+	})
 
-		// Write to the ResponseWriter, `w`.
-		fmt.Fprintf(rw, "event: counter\n\ndata: Message %d\n\n", i)
+	server.OnEvent("/chat", "msg", func(s socketio.Conn, msg string) string {
+		s.SetContext(msg)
+		return "recv " + msg
+	})
 
-		// Flush the response.  This is only possible if
-		// the repsonse supports streaming.
-		f.Flush()
-		time.Sleep(1 * time.Second)
-	}
-	log.Printf("SSE done")
+	server.OnEvent("/", "bye", func(s socketio.Conn) string {
+		last := s.Context().(string)
+		s.Emit("bye", last)
+		s.Close()
+		return last
+	})
+
+	server.OnError("/", func(s socketio.Conn, e error) {
+		fmt.Println("meet error:", e)
+	})
+
+	server.OnDisconnect("/", func(s socketio.Conn, reason string) {
+		fmt.Println("closed", reason)
+	})
+
+	go server.Serve()
+
+	return
 }
 
 func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, err error) {
@@ -391,4 +273,153 @@ func getFreePort() int {
 	}
 
 	return lis.Addr().(*net.TCPAddr).Port
+}
+
+func ws(w http.ResponseWriter, r *http.Request) {
+	var c *cdp.Client
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Print("upgrade:", err)
+		return
+	}
+	client := make(chan []byte, 100)
+	stop := make(chan struct{}, 1)
+	lock.Lock()
+	stops[idx] = stop
+	clientid := idx
+	idx += 1
+	lock.Unlock()
+	defer conn.Close()
+	go func() {
+		var proc *os.Process
+		var port int
+		for {
+			evt := event{}
+			t, data, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("got err %v", err)
+				break
+			}
+			log.Printf("got type %d, data %s,", t, string(data))
+			if t == websocket.CloseMessage {
+				break
+			}
+			if err := json.Unmarshal(data, &evt); err != nil {
+				log.Printf("got marshal err %v", err)
+				continue
+			}
+			if evt.Type == "start" {
+				if proc != nil {
+					log.Printf("killing %d on %d", proc.Pid, port)
+					if err := proc.Kill(); err != nil {
+						log.Printf("clould not kill %d: %v", proc.Pid, err)
+					}
+				}
+				port, proc, err = startChrome(evt.Width, evt.Height)
+				if err != nil {
+					w.WriteHeader(500)
+					w.Write([]byte(fmt.Sprintf("start chrome err %v", err)))
+					break
+				}
+				go func() {
+					var err error
+					var conn *rpcc.Conn
+					ctx, cancel := context.WithCancel(context.TODO())
+					defer cancel()
+					if c, conn, err = newClient(ctx, port); err != nil {
+						log.Printf("ERROR newClient err %v", err)
+						w.WriteHeader(500)
+						return
+					}
+					time.Sleep(100 * time.Millisecond)
+					defer conn.Close()
+					if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
+						log.Printf("resize err %v", err)
+					}
+					if err := run(ctx, port, c, evt.Width, evt.Height, client, stop); err != nil {
+						log.Printf("ERROR run err %v", err)
+						w.WriteHeader(500)
+					}
+				}()
+				continue
+			} else if evt.Type == "resize" {
+				if err := c.Emulation.SetDeviceMetricsOverride(context.TODO(), emulation.NewSetDeviceMetricsOverrideArgs(evt.Width, evt.Height, 1, false)); err != nil {
+					log.Printf("resize err %v", err)
+				}
+			}
+			if c == nil {
+				continue
+			}
+			if strings.HasPrefix(evt.Type, "navigate") {
+				switch evt.Type {
+				case "navigateTo":
+					repl, err := c.Page.Navigate(context.TODO(), page.NewNavigateArgs(evt.Url))
+					if err != nil {
+						log.Printf("navigate error %v", err)
+						continue
+					}
+					if repl.ErrorText != nil {
+						log.Printf("naviagate reply error %s", *repl.ErrorText)
+					}
+				case "navigateBack", "navigateForward":
+					his, err := c.Page.GetNavigationHistory(context.TODO())
+					if err != nil {
+						log.Printf("get history error %v", err)
+						continue
+					}
+					idx := his.CurrentIndex
+					if evt.Type == "navigateBack" && idx > 0 {
+						idx--
+					} else if evt.Type == "navigateForward" && idx < len(his.Entries)-1 {
+						idx++
+					}
+					if idx == his.CurrentIndex {
+						continue
+					}
+					if err := c.Page.NavigateToHistoryEntry(context.TODO(), page.NewNavigateToHistoryEntryArgs(his.Entries[idx].ID)); err != nil {
+						log.Printf("navigateback error %v", err)
+					}
+				}
+			} else if strings.HasPrefix(evt.Type, "mouse") {
+				log.Printf("got mouse event %s", evt.Type)
+				args := input.NewDispatchMouseEventArgs(evt.Type, float64(evt.X), float64(evt.Y))
+				args.SetModifiers(evt.Modifiers).SetButton(input.MouseButton(evt.Button))
+				if evt.ClickCount > 0 {
+					args.SetClickCount(evt.ClickCount)
+				}
+				if evt.Type == "mouseWheel" {
+					args.SetDeltaX(float64(evt.DeltaX)).SetDeltaY(float64(evt.DeltaY))
+				}
+				if err := c.Input.DispatchMouseEvent(context.TODO(), args); err != nil {
+					log.Printf("mouse err %v", err)
+				}
+			} else if strings.HasPrefix(evt.Type, "key") || evt.Type == "char" {
+				args := input.NewDispatchKeyEventArgs(evt.Type)
+				args.SetCode(evt.Code).SetKey(evt.Key).SetModifiers(evt.Modifiers).SetWindowsVirtualKeyCode(evt.KeyCode).SetNativeVirtualKeyCode(evt.KeyCode)
+				if evt.Text != "" {
+					args.SetText(evt.Text)
+				}
+				if err := c.Input.DispatchKeyEvent(context.TODO(), args); err != nil {
+					log.Printf("key err %v", err)
+				}
+			}
+		}
+		if stop != nil {
+			stop <- struct{}{}
+		}
+		if proc != nil {
+			log.Printf("killing %d on %d", proc.Pid, port)
+			if err := proc.Kill(); err != nil {
+				log.Printf("clould not kill %d: %v", proc.Pid, err)
+			}
+		}
+	}()
+
+	for data := range client {
+		if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+			log.Printf("error: could not write message %v", err)
+			break
+		}
+	}
+	delete(stops, clientid)
 }
