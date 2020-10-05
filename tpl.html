@@ -9,7 +9,7 @@
     }
     var ws;
 
-    window.addEventListener("load", function (evt) {
+    /*window.addEventListener("load", function (evt) {
       console.log("loaded");
 
       document.querySelector("#btnGo").addEventListener("click", (e) => {
@@ -117,7 +117,7 @@
         ws.send(JSON.stringify(args))
       })
 
-    });
+    });*/
   </script>
   <style>
     html,
@@ -146,6 +146,21 @@
     <button id="btnR">R</button>
   </div>
   <canvas></canvas>
+  <script>
+    const evtSrc = new EventSource("./sse/")
+
+    evtSrc.onmessage = function (msg) {
+      console.log(msg)
+    }
+
+    evtSrc.onopen = function (e) {
+      console.log(e)
+    }
+
+    evtSrc.onerror = function (er) {
+      console.log(er)
+    }
+  </script>
 </body>
 
 </html>

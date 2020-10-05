@@ -77,6 +77,8 @@ func main() {
 	}()
 
 	http.Handle(base+"/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		return
 		for k, h := range r.Header {
 			log.Printf("%s: %s", k, strings.Join(h, ", "))
 		}
@@ -239,7 +241,33 @@ func main() {
 		rw.Write(data)
 	}))
 
+	http.Handle(base+"/sse/", http.HandlerFunc(sse))
+
 	panic(http.ListenAndServe("localhost:5555", nil))
+}
+
+func sse(rw http.ResponseWriter, r *http.Request) {
+	f, ok := rw.(http.Flusher)
+	if !ok {
+		http.Error(rw, "Streaming unsupported!", http.StatusInternalServerError)
+		return
+	}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	rw.Header().Set("Cache-Control", "no-cache")
+	rw.Header().Set("Connection", "keep-alive")
+	rw.Header().Set("Transfer-Encoding", "chunked")
+
+	for i := 0; i < 100; i++ {
+
+		// Write to the ResponseWriter, `w`.
+		fmt.Fprintf(rw, "event: counter\n\ndata: Message %d\n\n", i)
+
+		// Flush the response.  This is only possible if
+		// the repsonse supports streaming.
+		f.Flush()
+		time.Sleep(1 * time.Second)
+	}
+	log.Printf("SSE done")
 }
 
 func newClient(ctx context.Context, port int) (c *cdp.Client, conn *rpcc.Conn, err error) {
